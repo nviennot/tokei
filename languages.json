@@ -1288,6 +1288,9 @@
       "quotes": [["\\\"", "\\\""], ["#\\\"", "\\\"#"]],
       "verbatim_quotes": [["r##\\\"", "\\\"##"], ["r#\\\"", "\\\"#"]]
     },
+    "Tests": {},
+    "Examples": {},
+    "Benchmarks": {},
     "Sass": {
       "line_comment": ["//"],
       "multi_line_comments": [["/*", "*/"]],
