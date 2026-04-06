@@ -1614,11 +1614,14 @@
       "line_comment": ["//"],
       "multi_line_comments": [["/*", "*/"]],
       "nested": true,
-      "important_syntax": ["///", "//!"],
+      "important_syntax": ["///", "//!", "#[cfg(test)]", "#[test]"],
       "extensions": ["rs"],
       "quotes": [["\\\"", "\\\""], ["#\\\"", "\\\"#"]],
       "verbatim_quotes": [["r##\\\"", "\\\"##"], ["r#\\\"", "\\\"#"]]
     },
+    "Tests": {},
+    "Examples": {},
+    "Benchmarks": {},
     "Sass": {
       "line_comment": ["//"],
       "multi_line_comments": [["/*", "*/"]],

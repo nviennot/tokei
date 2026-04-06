@@ -51,9 +51,23 @@ impl LanguageType {
             s
         };
 
+        let inner_type = match self {
+            LanguageType::Rust => Self::classify_rust_path(&path),
+            LanguageType::Kotlin => Self::classify_standard_path(&path),
+            LanguageType::Swift => Self::classify_standard_path(&path),
+            LanguageType::JavaScript => Self::classify_js_path(&path),
+            LanguageType::TypeScript => Self::classify_js_path(&path),
+            _ => None,
+        };
+
         let mut stats = Report::new(path);
 
-        stats += self.parse_from_slice(text, config);
+        let file_stats = self.parse_from_slice(&text, config);
+        if let Some(inner_type) = inner_type {
+            *stats.stats.blobs.entry(inner_type).or_default() += file_stats;
+        } else {
+            stats += file_stats;
+        }
 
         Ok(stats)
     }
@@ -67,10 +81,10 @@ impl LanguageType {
     pub fn parse_from_slice<A: AsRef<[u8]>>(self, text: A, config: &Config) -> CodeStats {
         let text = text.as_ref();
 
-        if self == Jupyter {
+        if self == LanguageType::Jupyter {
             return self
                 .parse_jupyter(text.as_ref(), config)
-                .unwrap_or_default();
+                .unwrap_or_else(CodeStats::new);
         }
 
         let syntax = {
@@ -154,6 +168,44 @@ impl LanguageType {
             };
             trace!("{}", String::from_utf8_lossy(line));
 
+            let is_test = line.starts_with(b"#[cfg(test)]") || line.starts_with(b"#[test]");
+            if is_test {
+                let test_start = end;
+                let rest = &lines[test_start..];
+                // Use line-based brace scanning instead of byte-level to
+                // reduce false matches from braces inside strings/comments.
+                let mut brace_depth: isize = 0;
+                let mut found_open = false;
+                let mut line_stepper = LineStep::new(b'\n', 0, rest.len());
+                let mut test_end = 0;
+                while let Some((s, e)) = line_stepper.next(rest) {
+                    let scan_line = rest[s..e].trim();
+                    test_end = e;
+                    for &c in scan_line {
+                        match c {
+                            b'{' => {
+                                brace_depth += 1;
+                                found_open = true;
+                            }
+                            b'}' => brace_depth -= 1,
+                            _ => {}
+                        }
+                    }
+                    if found_open && brace_depth <= 0 {
+                        break;
+                    }
+                }
+
+                let test_bytes = &rest[..test_end];
+                let syntax = SyntaxCounter::new(self);
+                let mut test_stats =
+                    self.parse_lines(config, test_bytes, Default::default(), syntax);
+                test_stats.code += 1; // The #[cfg(test)] / #[test] directive.
+                *stats.blobs.entry(LanguageType::Tests).or_default() += test_stats;
+                stepper = LineStep::new(b'\n', test_start + test_end, lines.len());
+                continue;
+            }
+
             if syntax.try_perform_single_line_analysis(line, &mut stats) {
                 continue;
             }
@@ -178,8 +230,11 @@ impl LanguageType {
                                 *stats.blobs.entry(language).or_default() += blob;
                             }
                             LanguageContext::Rust => {
-                                // Add all the markdown blobs.
-                                *stats.blobs.entry(LanguageType::Markdown).or_default() += blob;
+                                let mut doc = blob;
+                                if let Some(rust_in_doc) = doc.blobs.remove(&LanguageType::Rust) {
+                                    *stats.blobs.entry(LanguageType::Tests).or_default() += rust_in_doc;
+                                }
+                                *stats.blobs.entry(LanguageType::Markdown).or_default() += doc;
                             }
                             LanguageContext::LinguaFranca => {
                                 let child_lang = syntax.get_lf_target_language();
@@ -212,6 +267,90 @@ impl LanguageType {
         }
 
         stats
+    }
+
+    /// Classify a path component by suffix. Matches exact names like `test`,
+    /// `tests` as well as suffixed names like `blah_test`, `jvmTest`, etc.
+    fn classify_component(s: &str) -> Option<LanguageType> {
+        match s {
+            "test" | "tests" => return Some(LanguageType::Tests),
+            "example" | "examples" => return Some(LanguageType::Examples),
+            "bench" | "benches" | "benchmark" | "benchmarks" => {
+                return Some(LanguageType::Benchmarks)
+            }
+            _ => {}
+        }
+        // Suffixed: blah_test, blah_tests, jvmTest, commonTests, etc.
+        if s.ends_with("test") || s.ends_with("Test")
+            || s.ends_with("tests") || s.ends_with("Tests")
+        {
+            Some(LanguageType::Tests)
+        } else if s.ends_with("example") || s.ends_with("Example")
+            || s.ends_with("examples") || s.ends_with("Examples")
+        {
+            Some(LanguageType::Examples)
+        } else if s.ends_with("bench") || s.ends_with("Bench")
+            || s.ends_with("benches") || s.ends_with("Benches")
+            || s.ends_with("benchmark") || s.ends_with("Benchmark")
+            || s.ends_with("benchmarks") || s.ends_with("Benchmarks")
+        {
+            Some(LanguageType::Benchmarks)
+        } else {
+            None
+        }
+    }
+
+    fn classify_rust_path(path: &Path) -> Option<LanguageType> {
+        use std::path::Component;
+
+        let component_match = path.components().find_map(|c| match c {
+            Component::Normal(s) => Self::classify_component(s.to_str()?),
+            _ => None,
+        });
+
+        // Fall back to file stem for files like test.rs.
+        component_match.or_else(|| {
+            Self::classify_component(path.file_stem()?.to_str()?)
+        })
+    }
+
+    /// Path-based classification for languages with standard test/example/bench
+    /// directory conventions (Kotlin, Swift, etc.).
+    fn classify_standard_path(path: &Path) -> Option<LanguageType> {
+        use std::path::Component;
+
+        path.components().find_map(|c| match c {
+            Component::Normal(s) => Self::classify_component(s.to_str()?),
+            _ => None,
+        })
+    }
+
+    /// Path-based classification for JavaScript/TypeScript, which additionally
+    /// recognise `__tests__/` directories and `*.test.*` / `*.spec.*` file
+    /// naming conventions.
+    fn classify_js_path(path: &Path) -> Option<LanguageType> {
+        use std::path::Component;
+
+        let component_match = path.components().find_map(|c| match c {
+            Component::Normal(s) => {
+                let s = s.to_str()?;
+                if s == "__tests__" {
+                    Some(LanguageType::Tests)
+                } else {
+                    Self::classify_component(s)
+                }
+            }
+            _ => None,
+        });
+
+        component_match.or_else(|| {
+            let stem = path.file_stem().and_then(|s| s.to_str())?;
+            if stem.ends_with(".test") || stem.ends_with(".spec") {
+                Some(LanguageType::Tests)
+            } else {
+                Self::classify_component(stem)
+            }
+        })
     }
 
     fn parse_jupyter(&self, json: &[u8], config: &Config) -> Option<CodeStats> {
